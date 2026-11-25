@@ -12,6 +12,13 @@
  * Run:
  *   ./gralloc_dump [outdir]          (default: ./gralloc_out)
  *
+ * Scan mode (needs root): look for live shared-metadata regions inside another
+ * process (e.g. surfaceflinger) and print the non-zero words of each distinct
+ * one. Used to find slots that only producers fill in, such as crop.
+ *   pid=$(su -c pidof surfaceflinger)
+ *   su -c "$PWD/gralloc_dump --scan $pid"
+ * The output includes buffer names (window/app names): review it first.
+ *
  * Everything is also printed, so the files are a backup: send both the
  * console output and the outdir contents.
  */
@@ -19,6 +26,7 @@
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -176,7 +184,107 @@ static void dump_one(const char* outdir, uint32_t fmt, uint32_t w, uint32_t h) {
     p_release(buf);
 }
 
+/* Layout seen on the Exynos 1380 (A54): region of 0x33c8 bytes, name slot
+ * (u32 length + ASCII) at 0x32c0, dataspace flag/value at 0x2a88/0x2a8c. */
+#define SCAN_MAP_SIZE 0x33c8
+#define SCAN_NAME_OFF 0x32c0
+#define SCAN_DS_OFF   0x2a88
+#define SCAN_MAX_SHOWN 40
+
+static uint64_t fnv1a(const uint8_t* p, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int scan_pid(const char* pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%s/maps", pid);
+    FILE* maps = fopen(path, "r");
+    if (!maps) {
+        perror(path);
+        return 1;
+    }
+    snprintf(path, sizeof(path), "/proc/%s/mem", pid);
+    int mem = open(path, O_RDONLY);
+    if (mem < 0) {
+        perror(path);
+        fclose(maps);
+        return 1;
+    }
+    uint8_t* buf = malloc(SCAN_MAP_SIZE);
+    if (!buf) {
+        close(mem);
+        fclose(maps);
+        return 1;
+    }
+
+    const unsigned long long rounded = (SCAN_MAP_SIZE + 0xfffULL) & ~0xfffULL;
+    uint64_t seen[256];
+    unsigned nseen = 0, cand = 0, valid = 0, shown = 0;
+    char line[512];
+
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long long s, e;
+        char perms[8] = {0};
+        if (sscanf(line, "%llx-%llx %7s", &s, &e, perms) != 3) continue;
+        if (e - s != rounded || perms[0] != 'r' || perms[3] != 's') continue;
+        cand++;
+        if (pread(mem, buf, SCAN_MAP_SIZE, (off_t)s) != SCAN_MAP_SIZE) continue;
+
+        uint32_t nlen = rd32(buf, SCAN_NAME_OFF);
+        if (nlen == 0 || nlen > 0xfc) continue;
+        int printable = 1;
+        for (uint32_t i = 0; i < nlen; i++) {
+            uint8_t c = buf[SCAN_NAME_OFF + 4 + i];
+            if (c < 0x20 || c > 0x7e) {
+                printable = 0;
+                break;
+            }
+        }
+        if (!printable) continue;
+        valid++;
+
+        /* Skip regions whose metadata (everything before the name) repeats. */
+        uint64_t hsh = fnv1a(buf, SCAN_NAME_OFF);
+        int dup = 0;
+        for (unsigned i = 0; i < nseen; i++) {
+            if (seen[i] == hsh) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) continue;
+        if (nseen < sizeof(seen) / sizeof(seen[0])) seen[nseen++] = hsh;
+        if (shown >= SCAN_MAX_SHOWN) continue;
+        shown++;
+
+        printf("\n--- region @0x%llx name=\"%.*s\"\n", s, (int)nlen,
+               (const char*)buf + SCAN_NAME_OFF + 4);
+        printf("    dataspace flag=%u value=0x%x\n", rd32(buf, SCAN_DS_OFF),
+               rd32(buf, SCAN_DS_OFF + 4));
+        unsigned printed = 0;
+        for (size_t o = 0; o + 4 <= SCAN_NAME_OFF && printed < 32; o += 4) {
+            uint32_t v = rd32(buf, o);
+            if (!v) continue;
+            printf("    0x%04zx = 0x%08x (%d)\n", o, v, (int)v);
+            printed++;
+        }
+    }
+
+    printf("\nscan summary: %u mappings of size 0x%llx, %u look like metadata, "
+           "%u distinct shown\n", cand, rounded, valid, shown);
+    free(buf);
+    close(mem);
+    fclose(maps);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 3 && strcmp(argv[1], "--scan") == 0) return scan_pid(argv[2]);
     const char* outdir = argc > 1 ? argv[1] : "./gralloc_out";
     if (mkdir(outdir, 0755) != 0 && errno != EEXIST) {
         fprintf(stderr, "cannot create %s: %s\n", outdir, strerror(errno));
