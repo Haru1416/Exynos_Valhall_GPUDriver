@@ -25,6 +25,7 @@
 #define _GNU_SOURCE
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -34,6 +35,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 /* Same layout as libcutils native_handle_t. */
@@ -297,11 +299,139 @@ static int scan_pid(const char* pid) {
     free(buf);
     close(mem);
     fclose(maps);
+    /* 2: every read failed, so the caller should try the fd method. */
+    return (cand && read_fail == cand) ? 2 : 0;
+}
+
+/* Fallback: /proc/pid/mem cannot read dma-buf mappings of another process
+ * (EIO). Duplicate the process's dma-buf fds with pidfd_getfd and map them
+ * here instead. Set GRALLOC_SCAN_ANY=1 to skip the "dmabuf" name filter. */
+static int scan_fds(const char* pidstr) {
+    pid_t pid = (pid_t)atoi(pidstr);
+    int pidfd = (int)syscall(434 /* __NR_pidfd_open */, pid, 0);
+    if (pidfd < 0) {
+        perror("pidfd_open");
+        return 1;
+    }
+    char dirpath[64];
+    snprintf(dirpath, sizeof(dirpath), "/proc/%d/fd", (int)pid);
+    DIR* dir = opendir(dirpath);
+    if (!dir) {
+        perror(dirpath);
+        close(pidfd);
+        return 1;
+    }
+
+    const int any = getenv("GRALLOC_SCAN_ANY") != NULL;
+    uint64_t seen[256];
+    unsigned nseen = 0, cand = 0, valid = 0, shown = 0, fail = 0, dbg = 0, total = 0;
+    int first_errno = 0;
+    const char* first_what = "";
+    struct dirent* de;
+
+    while ((de = readdir(dir)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        int tfd = atoi(de->d_name);
+        char lp[320], target[256];
+        snprintf(lp, sizeof(lp), "%s/%s", dirpath, de->d_name);
+        ssize_t n = readlink(lp, target, sizeof(target) - 1);
+        if (n <= 0) continue;
+        target[n] = 0;
+        if (!any && !strstr(target, "dmabuf")) continue;
+        total++;
+
+        int fd = (int)syscall(438 /* __NR_pidfd_getfd */, pidfd, tfd, 0);
+        if (fd < 0) {
+            if (!fail) {
+                first_errno = errno;
+                first_what = "pidfd_getfd";
+            }
+            fail++;
+            continue;
+        }
+        off_t sz = lseek(fd, 0, SEEK_END);
+        if (sz < SCAN_MAP_SIZE || sz > 0x10000) {
+            close(fd);
+            continue;
+        }
+        cand++;
+        uint8_t* m = mmap(NULL, SCAN_MAP_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+        if (m == MAP_FAILED) {
+            if (!fail) {
+                first_errno = errno;
+                first_what = "mmap";
+            }
+            fail++;
+            close(fd);
+            continue;
+        }
+
+        uint32_t nlen = rd32(m, SCAN_NAME_OFF);
+        int printable = nlen != 0 && nlen <= 0xfc;
+        for (uint32_t i = 0; printable && i < nlen; i++) {
+            uint8_t c = m[SCAN_NAME_OFF + 4 + i];
+            if (c < 0x20 || c > 0x7e) printable = 0;
+        }
+        if (!printable) {
+            if (dbg < 8) {
+                unsigned nz = 0;
+                for (size_t o = 0; o + 4 <= SCAN_MAP_SIZE; o += 4) nz += rd32(m, o) != 0;
+                printf("  rejected fd %d [%s] size=0x%llx name_len=%u ds=%u/0x%x nonzero_words=%u\n",
+                       tfd, target, (unsigned long long)sz, nlen, rd32(m, SCAN_DS_OFF),
+                       rd32(m, SCAN_DS_OFF + 4), nz);
+                dbg++;
+            }
+        } else {
+            valid++;
+            uint64_t hsh = fnv1a(m, SCAN_NAME_OFF);
+            int dup = 0;
+            for (unsigned i = 0; i < nseen; i++) {
+                if (seen[i] == hsh) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup) {
+                if (nseen < sizeof(seen) / sizeof(seen[0])) seen[nseen++] = hsh;
+                if (shown < SCAN_MAX_SHOWN) {
+                    shown++;
+                    printf("\n--- fd %d [%s] name=\"%.*s\"\n", tfd, target, (int)nlen,
+                           (const char*)m + SCAN_NAME_OFF + 4);
+                    printf("    dataspace flag=%u value=0x%x\n", rd32(m, SCAN_DS_OFF),
+                           rd32(m, SCAN_DS_OFF + 4));
+                    unsigned printed = 0;
+                    for (size_t o = 0; o + 4 <= SCAN_NAME_OFF && printed < 32; o += 4) {
+                        uint32_t v = rd32(m, o);
+                        if (!v) continue;
+                        printf("    0x%04zx = 0x%08x (%d)\n", o, v, (int)v);
+                        printed++;
+                    }
+                }
+            }
+        }
+        munmap(m, SCAN_MAP_SIZE);
+        close(fd);
+    }
+
+    printf("\nfd scan summary: %u dma-buf fds, %u of plausible size, %u look like metadata, "
+           "%u distinct shown\n", total, cand, valid, shown);
+    if (fail) {
+        printf("%u failures (first: %s, errno %d: %s)\n", fail, first_what, first_errno,
+               strerror(first_errno));
+    }
+    closedir(dir);
+    close(pidfd);
     return 0;
 }
 
 int main(int argc, char** argv) {
-    if (argc == 3 && strcmp(argv[1], "--scan") == 0) return scan_pid(argv[2]);
+    if (argc == 3 && strcmp(argv[1], "--scan") == 0) {
+        int r = scan_pid(argv[2]);
+        if (r != 2) return r;
+        printf("\n/proc/pid/mem unreadable, falling back to the fd method\n");
+        return scan_fds(argv[2]);
+    }
+    if (argc == 3 && strcmp(argv[1], "--scan-fd") == 0) return scan_fds(argv[2]);
     const char* outdir = argc > 1 ? argv[1] : "./gralloc_out";
     if (mkdir(outdir, 0755) != 0 && errno != EEXIST) {
         fprintf(stderr, "cannot create %s: %s\n", outdir, strerror(errno));
