@@ -224,28 +224,41 @@ static int scan_pid(const char* pid) {
 
     const unsigned long long rounded = (SCAN_MAP_SIZE + 0xfffULL) & ~0xfffULL;
     uint64_t seen[256];
-    unsigned nseen = 0, cand = 0, valid = 0, shown = 0;
+    unsigned nseen = 0, cand = 0, valid = 0, shown = 0, read_fail = 0, dbg = 0;
+    int first_errno = 0;
     char line[512];
 
     while (fgets(line, sizeof(line), maps)) {
         unsigned long long s, e;
         char perms[8] = {0};
-        if (sscanf(line, "%llx-%llx %7s", &s, &e, perms) != 3) continue;
+        char where[128] = "";
+        if (sscanf(line, "%llx-%llx %7s %*s %*s %*s %127[^\n]", &s, &e, perms, where) < 3)
+            continue;
         if (e - s != rounded || perms[0] != 'r' || perms[3] != 's') continue;
         cand++;
-        if (pread(mem, buf, SCAN_MAP_SIZE, (off_t)s) != SCAN_MAP_SIZE) continue;
+        if (pread(mem, buf, SCAN_MAP_SIZE, (off_t)s) != SCAN_MAP_SIZE) {
+            if (!read_fail) first_errno = errno;
+            read_fail++;
+            continue;
+        }
 
         uint32_t nlen = rd32(buf, SCAN_NAME_OFF);
-        if (nlen == 0 || nlen > 0xfc) continue;
-        int printable = 1;
-        for (uint32_t i = 0; i < nlen; i++) {
+        int printable = nlen != 0 && nlen <= 0xfc;
+        for (uint32_t i = 0; printable && i < nlen; i++) {
             uint8_t c = buf[SCAN_NAME_OFF + 4 + i];
-            if (c < 0x20 || c > 0x7e) {
-                printable = 0;
-                break;
-            }
+            if (c < 0x20 || c > 0x7e) printable = 0;
         }
-        if (!printable) continue;
+        if (!printable) {
+            /* Show what the rejected mappings look like (first few only). */
+            if (dbg < 8) {
+                unsigned nz = 0;
+                for (size_t o = 0; o + 4 <= SCAN_MAP_SIZE; o += 4) nz += rd32(buf, o) != 0;
+                printf("  rejected @0x%llx [%s] name_len=%u ds=%u/0x%x nonzero_words=%u\n", s,
+                       where, nlen, rd32(buf, SCAN_DS_OFF), rd32(buf, SCAN_DS_OFF + 4), nz);
+                dbg++;
+            }
+            continue;
+        }
         valid++;
 
         /* Skip regions whose metadata (everything before the name) repeats. */
@@ -277,6 +290,10 @@ static int scan_pid(const char* pid) {
 
     printf("\nscan summary: %u mappings of size 0x%llx, %u look like metadata, "
            "%u distinct shown\n", cand, rounded, valid, shown);
+    if (read_fail) {
+        printf("memory read failed for %u mappings (first errno %d: %s)\n", read_fail,
+               first_errno, strerror(first_errno));
+    }
     free(buf);
     close(mem);
     fclose(maps);
