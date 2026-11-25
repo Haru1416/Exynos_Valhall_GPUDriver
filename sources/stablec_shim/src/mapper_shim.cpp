@@ -897,12 +897,15 @@ static int32_t write_plane_layouts(const native_handle_t* h, void* out, size_t s
     return (int32_t)need;
 }
 
-/* SoC layout for a mapping of this size; 2100 mappings are the larger
- * of the two so they must be tested first. */
+/* SoC layout for a mapping of this size. 2100 mappings are the largest so they
+ * are tested first. The 1380 size sits between the other two, so it has to be
+ * an exact match and must be tested before the 1280 minimum-size check. */
 static const ShmLayout* shm_layout(size_t map_size) {
     static const ShmLayout kLayout2100 = SHM_LAYOUT_EXYNOS2100;
+    static const ShmLayout kLayout1380 = SHM_LAYOUT_EXYNOS1380;
     static const ShmLayout kLayout1280 = SHM_LAYOUT_EXYNOS1280;
     if (map_size >= kLayout2100.min_map_size) return &kLayout2100;
+    if (map_size == kLayout1380.min_map_size) return &kLayout1380;
     if (map_size >= kLayout1280.min_map_size) return &kLayout1280;
     return nullptr;
 }
@@ -917,6 +920,20 @@ static bool shm_read(const native_handle_t* h, size_t slot, void* out, size_t le
     memcpy(&flag, (const void*)(uintptr_t)(base + slot), 4);
     if (!flag) return false;
     memcpy(out, (const void*)(uintptr_t)(base + slot + 4), len);
+    return true;
+}
+
+/* Width and height words (u32 each) left by a producer, for layouts whose crop
+ * is not a flag slot. False when absent, zero, or implausibly large. */
+static bool shm_read_size(const native_handle_t* h, size_t off, int32_t out[2]) {
+    uint64_t base = h_u64(h, PH_MAPPED_ADDR);
+    size_t map_size = (size_t)h_u64(h, PH_MAPPED_SIZE);
+    if (!base || !shm_layout(map_size) || off + 8 > map_size) return false;
+    uint32_t v[2];
+    memcpy(v, (const void*)(uintptr_t)(base + off), sizeof(v));
+    if (!v[0] || !v[1] || v[0] > 16384 || v[1] > 16384) return false;
+    out[0] = (int32_t)v[0];
+    out[1] = (int32_t)v[1];
     return true;
 }
 
@@ -1096,11 +1113,20 @@ static int32_t shim_getStandardMetadata(const native_handle_t* buffer, int64_t n
                 if (!has_crop) {
                     int32_t rect[4];
                     const ShmLayout* l = shm_layout((size_t)h_u64(h, PH_MAPPED_SIZE));
-                    if (l && shm_read(h, l->crop_rect, rect, sizeof(rect))) {
+                    int32_t wh[2];
+                    if (l && l->crop_rect && shm_read(h, l->crop_rect, rect, sizeof(rect))) {
                         crop_l = rect[0];
                         crop_t = rect[1];
                         crop_r = rect[2];
                         crop_b = rect[3];
+                        has_crop = true;
+                    } else if (l && l->crop_size && shm_read_size(h, l->crop_size, wh) &&
+                               wh[0] <= h_i32(h, PH_WIDTH) && wh[1] <= h_i32(h, PH_HEIGHT)) {
+                        /* Never larger than the buffer; otherwise keep the full frame. */
+                        crop_l = 0;
+                        crop_t = 0;
+                        crop_r = wh[0];
+                        crop_b = wh[1];
                         has_crop = true;
                     }
                 }
@@ -1222,7 +1248,8 @@ static int32_t shim_setStandardMetadata(buffer_handle_t buffer, int64_t name, co
         int32_t rect[4];
         memcpy(rect, (const char*)data + at, sizeof(rect));
         const ShmLayout* l = shm_layout((size_t)h_u64(h, PH_MAPPED_SIZE));
-        if (l) shm_write(h, l->crop_rect, rect, sizeof(rect));
+        /* crop_rect 0 means this layout has no flag-slot crop to publish into. */
+        if (l && l->crop_rect) shm_write(h, l->crop_rect, rect, sizeof(rect));
         return AIMAPPER_ERROR_NONE;
     }
     if ((name >= 16 && name <= 21) || name == SMD_BLEND_MODE) {

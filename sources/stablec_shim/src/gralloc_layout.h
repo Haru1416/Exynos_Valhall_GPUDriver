@@ -50,18 +50,40 @@
 #define SHM_CROP_FLAG_EXYNOS1280      0x2440
 #define SHM_CROP_RECT_EXYNOS1280      0x2444
 
+/* Exynos 1380 (Galaxy A54), measured on a device with 0x33c8-byte mappings:
+ *  - dataspace is a normal slot: flag u32 at 0x2a88 (always 1), value at
+ *    0x2a8c. The gralloc fills the value in itself for YUV buffers.
+ *  - crop is NOT a flag slot. Video producers leave two u32 words, width at
+ *    0x7b4 and height at 0x7b8 (1080x1920 for a vertical clip, so the order is
+ *    w,h), next to a 0x100 word at 0x0. The flag word at 0x7a8 stays 0, and
+ *    whether this is a crop rect (right,bottom) or a plain size is not yet
+ *    known, so it is only read, as {0,0,w,h}, and never written.
+ * The shim passes dataspace_val to shm_read/shm_write as the slot offset
+ * (which is the flag word), so for this layout dataspace_val holds the slot
+ * offset 0x2a88. See the NOTE in the layout table below. */
+#define SHM_MAP_SIZE_EXYNOS1380       0x33c8
+#define SHM_DATASPACE_SLOT_EXYNOS1380 0x2a88
+#define SHM_CROP_SIZE_EXYNOS1380      0x7b4
+
 /* Per-SoC shared-metadata layout. */
 struct ShmLayout {
-    size_t min_map_size;
+    size_t min_map_size;  /* 1380 matches this size exactly, the others as a minimum */
     size_t dataspace_flag;
     size_t dataspace_val;
     size_t crop_flag;
-    size_t crop_rect;
+    size_t crop_rect;     /* 0 = no flag-slot crop, never read or written */
+    size_t crop_size;     /* 0 = none; else offset of u32 width, u32 height (read only) */
 };
 
 #define SHM_LAYOUT_EXYNOS2100 {0x8088, SHM_DATASPACE_FLAG_EXYNOS2100, \
     SHM_DATASPACE_VAL_EXYNOS2100, SHM_CROP_FLAG_EXYNOS2100, \
-    SHM_CROP_RECT_EXYNOS2100}
+    SHM_CROP_RECT_EXYNOS2100, 0}
 #define SHM_LAYOUT_EXYNOS1280 {0x2468, SHM_DATASPACE_FLAG_EXYNOS1280, \
     SHM_DATASPACE_VAL_EXYNOS1280, SHM_CROP_FLAG_EXYNOS1280, \
-    SHM_CROP_RECT_EXYNOS1280}
+    SHM_CROP_RECT_EXYNOS1280, 0}
+/* NOTE: dataspace_val is the slot (flag) offset here, because that is what the
+ * dataspace call sites hand to shm_read/shm_write. crop_flag/crop_rect are 0:
+ * the crop is read through crop_size instead. */
+#define SHM_LAYOUT_EXYNOS1380 {SHM_MAP_SIZE_EXYNOS1380, \
+    SHM_DATASPACE_SLOT_EXYNOS1380, SHM_DATASPACE_SLOT_EXYNOS1380, 0, 0, \
+    SHM_CROP_SIZE_EXYNOS1380}
